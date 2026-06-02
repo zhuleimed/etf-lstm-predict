@@ -16,8 +16,8 @@ import numpy as np
 import pandas as pd
 
 from config.etf_config import (
-    ETF_CODES, ETF_DESCRIPTIONS, ETF_TAX_FREE,
-    INITIAL_CAPITAL, INITIAL_CAPITAL_PER_ETF,
+    ETF_CODES, TRADING_ETF, ETF_DESCRIPTIONS, ETF_TAX_FREE,
+    INITIAL_CAPITAL,
     MIN_TRADE_UNIT, POSITION_PCT,
     SLIPPAGE, COMMISSION_RATE,
     SIGNAL_THRESHOLD, STOP_LOSS_PCT,
@@ -115,22 +115,20 @@ class Simulator:
                     trade['reason'] = 'risk_stop_loss'
                     trades_today.append(trade)
 
-        # ---- 7. 根据预测生成明日信号 ----
+        # ---- 7. 根据预测生成明日信号（仅交易 TRADING_ETF）----
         new_pending = {}
-        for etf in ETF_CODES:
-            if etf not in predictions or predictions[etf] is None:
-                new_pending[etf] = 'hold'
-                continue
+        target_etf = TRADING_ETF
+        pred = predictions.get(target_etf, None)
 
-            pred = predictions[etf]  # 预测涨跌幅（%）
-            if pred > SIGNAL_THRESHOLD * 100 and etf not in positions:
-                # 预测涨幅超过阈值且未持仓 → 买入信号
-                new_pending[etf] = 'buy'
-            elif pred < -SIGNAL_THRESHOLD * 100 and etf in positions:
-                # 预测跌幅超过阈值且已持仓 → 卖出信号
-                new_pending[etf] = 'sell'
+        if pred is not None:
+            if pred > SIGNAL_THRESHOLD * 100 and target_etf not in positions:
+                new_pending[target_etf] = 'buy'
+            elif pred < -SIGNAL_THRESHOLD * 100 and target_etf in positions:
+                new_pending[target_etf] = 'sell'
             else:
-                new_pending[etf] = 'hold'
+                new_pending[target_etf] = 'hold'
+        else:
+            new_pending[target_etf] = 'hold'
 
         # ---- 8. 计算组合市值 ----
         portfolio_value = cash
@@ -206,34 +204,33 @@ class Simulator:
 
     def _predict_all(self, etf_data: Dict) -> Dict[str, Optional[float]]:
         """
-        对每只 ETF 做预测。
+        用单一合并模型预测 TRADING_ETF。
 
         Returns
         -------
-        dict : {code: predicted_return_pct or None}
+        dict : {TRADING_ETF: predicted_return_pct or None, ...}
         """
-        predictions = {}
-        for code in ETF_CODES:
-            if code not in etf_data:
-                predictions[code] = None
-                continue
+        predictions = {code: None for code in ETF_CODES}
+        target = TRADING_ETF
 
-            df = etf_data[code]['df']
-            predictor = LSTMTransformerPredictor()
+        if target not in etf_data:
+            logger.warning(f'{target}: 无数据，无法预测')
+            return predictions
 
-            # 加载已有模型（训练由 run_daily.py 的 train_all_etf_models 负责）
-            if predictor.model_exists(code):
-                loaded = predictor.load(code)
-                if loaded:
-                    pred = predictor.predict_next_day(df)
-                    predictions[code] = pred
-                    logger.info(f'  {code} 预测: {pred:.4f}%')
-                    self.predictors[code] = predictor
-                    continue
+        df = etf_data[target]['df']
+        # 模型文件名固定为 combined（4 ETF 合并训练）
+        predictor = LSTMTransformerPredictor()
 
-            # 无模型 → 无法预测
-            predictions[code] = None
-            logger.warning(f'  {code}: 无历史模型，请先执行 --train')
+        if predictor.model_exists('combined'):
+            loaded = predictor.load('combined')
+            if loaded:
+                pred = predictor.predict_next_day(df)
+                predictions[target] = pred
+                logger.info(f'  {target} 预测: {pred:.4f}%')
+                self.predictors[target] = predictor
+                return predictions
+
+        logger.warning('无合并模型 (combined)，请先执行 --train')
         return predictions
 
     def _execute_buy(self, etf: str, open_price: float,
@@ -324,34 +321,20 @@ class Simulator:
 
     def _calc_benchmark_return(self, etf_data: Dict) -> float:
         """
-        计算基准收益率。
-
-        基准 = 等权买入持有所有 ETF 的累计收益。
-        以当前最新收盘价计算。
+        计算基准收益率（TRADING_ETF 的 buy-and-hold）。
         """
-        total = 0.0
-        count = 0
-        for code in ETF_CODES:
-            if code in etf_data:
-                df = etf_data[code]['df']
-                if len(df) >= 2:
-                    first_close = df.iloc[0]['close']
-                    last_close = df.iloc[-1]['close']
-                    ret = (last_close - first_close) / first_close
-                    total += ret
-                    count += 1
-        return total / count if count > 0 else 0.0
+        df = etf_data.get(TRADING_ETF, {}).get('df')
+        if df is not None and len(df) >= 2:
+            ret = (df['close'].iloc[-1] - df['close'].iloc[0]) / df['close'].iloc[0]
+            return round(ret, 4)
+        return 0.0
 
     def _get_model_status(self) -> Dict[str, str]:
-        status = {}
-        for code in ETF_CODES:
-            from model.lstm_transformer_predictor import LSTMTransformerPredictor
-            p = LSTMTransformerPredictor()
-            if p.model_exists(code):
-                status[code] = 'loaded'
-            else:
-                status[code] = 'none'
-        return status
+        """检查合并模型存在与否。"""
+        from model.lstm_transformer_predictor import LSTMTransformerPredictor
+        p = LSTMTransformerPredictor()
+        exists = p.model_exists('combined')
+        return {'combined': 'loaded' if exists else 'none'}
 
     def _print_summary(self, summary: Dict):
         """控制台输出摘要。"""

@@ -383,6 +383,166 @@ class LSTMTransformerPredictor:
 
         return True
 
+    def train_combined(self, df_list: list, use_simple: Optional[bool] = None) -> bool:
+        """
+        训练单一模型（合并多只 ETF 的数据）。
+
+        分别计算每只 ETF 的特征和序列，然后拼接为一个大训练集。
+        数据量 4× 提升，模型学到跨 ETF 的普适模式。
+
+        Parameters
+        ----------
+        df_list : list of pd.DataFrame
+            多只 ETF 的日线数据
+        use_simple : bool or None
+
+        Returns
+        -------
+        bool
+        """
+        if use_simple is None:
+            use_simple = self.use_simple
+
+        all_X, all_y = [], []
+        feature_cols = None
+
+        for idx, df in enumerate(df_list):
+            data = self.prepare_data_from_df(df)
+            if data is None:
+                print(f'  ⚠ ETF[{idx}]: 数据准备失败，跳过')
+                continue
+            X_train, y_train, X_val, y_val, X_test, y_test = data
+            all_X.append(np.concatenate([X_train, X_val, X_test]))
+            all_y.append(np.concatenate([y_train, y_val, y_test]))
+            if feature_cols is None:
+                feature_cols = self.feature_columns.copy()
+
+        if len(all_X) < 2:
+            print('  ⚠ 有效 ETF 不足 2 只，无法合并训练')
+            return self.train(df_list[0], use_simple=use_simple)
+
+        X_all = np.concatenate(all_X)
+        y_all = np.concatenate(all_y)
+        n = len(X_all)
+        print(f'  合并后总样本: {n} ({len(all_X)} 只 ETF)')
+
+        # 重新划分训练/验证/测试
+        train_end = int(n * TRAIN_RATIO)
+        val_end = train_end + int(n * VAL_RATIO)
+
+        X_tr, X_va, X_te = X_all[:train_end], X_all[train_end:val_end], X_all[val_end:]
+        y_tr, y_va, y_te = y_all[:train_end], y_all[train_end:val_end], y_all[val_end:]
+
+        # 重新标准化
+        if use_simple:
+            self.model = SimpleLSTMModel(X_tr.shape[2]).to(self.device)
+            print('  📦 简化版 LSTM（合并训练）')
+        else:
+            self.model = EnhancedLSTMTransformerModel(X_tr.shape[2], self.params).to(self.device)
+            print('  📦 增强版 LSTM-Transformer（合并训练）')
+
+        self.feature_columns = feature_cols or self.feature_columns
+
+        # 重新拟合 scaler
+        orig_shape = X_tr.shape
+        X_tr_2d = X_tr.reshape(-1, orig_shape[-1])
+        self.feature_scaler = StandardScaler()
+        X_tr = self.feature_scaler.fit_transform(X_tr_2d).reshape(orig_shape)
+
+        if len(X_va) > 0:
+            X_va_2d = X_va.reshape(-1, orig_shape[-1])
+            X_va = self.feature_scaler.transform(X_va_2d).reshape(X_va.shape)
+        if len(X_te) > 0:
+            X_te_2d = X_te.reshape(-1, orig_shape[-1])
+            X_te = self.feature_scaler.transform(X_te_2d).reshape(X_te.shape)
+
+        self.target_scaler = StandardScaler()
+        y_tr = y_tr.reshape(-1, 1)
+        y_tr = self.target_scaler.fit_transform(y_tr).reshape(-1)
+        if len(y_va) > 0:
+            y_va = y_va.reshape(-1, 1)
+            y_va = self.target_scaler.transform(y_va).reshape(-1)
+        if len(y_te) > 0:
+            y_te = y_te.reshape(-1, 1)
+            y_te = self.target_scaler.transform(y_te).reshape(-1)
+
+        # 标准训练循环（合并数据量大，自适应 batch_size 加速）
+        batch_size = min(32, max(8, len(X_tr) // 4))
+        train_dataset = StockDataset(X_tr, y_tr)
+        val_dataset = StockDataset(X_va, y_va)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size,
+                                  shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size,
+                                shuffle=False, num_workers=0)
+
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=self.params['lr'])
+        best_val_loss = float('inf')
+        patience = 0
+        best_state = None
+
+        for epoch in range(self.params['epochs']):
+            self.model.train()
+            train_loss = 0
+            for bx, by in train_loader:
+                bx, by = bx.to(self.device), by.to(self.device)
+                optimizer.zero_grad()
+                loss = criterion(self.model(bx), by)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                optimizer.step()
+                train_loss += loss.item()
+
+            self.model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for bx, by in val_loader:
+                    bx, by = bx.to(self.device), by.to(self.device)
+                    val_loss += criterion(self.model(bx), by).item()
+
+            avg_val = val_loss / len(val_loader)
+            if avg_val < best_val_loss:
+                best_val_loss = avg_val
+                best_state = self.model.state_dict().copy()
+                patience = 0
+            else:
+                patience += 1
+            if (epoch + 1) % 10 == 0:
+                print(f'  Epoch {epoch+1}/{self.params["epochs"]}  '
+                      f'train_loss={train_loss/len(train_loader):.4f}  '
+                      f'val_loss={avg_val:.4f}')
+            if patience >= EARLY_STOPPING_PATIENCE:
+                print(f'  早停 @ epoch {epoch+1}')
+                break
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+
+        # 测试集评估
+        if len(X_te) > 0:
+            self.model.eval()
+            te_dataset = StockDataset(X_te, y_te)
+            te_loader = DataLoader(te_dataset, batch_size=batch_size)
+            all_p, all_t = [], []
+            with torch.no_grad():
+                for bx, by in te_loader:
+                    pred = self.model(bx.to(self.device)).cpu().numpy()
+                    p_orig = self.target_scaler.inverse_transform(pred)
+                    t_orig = self.target_scaler.inverse_transform(by.numpy())
+                    all_p.append(p_orig)
+                    all_t.append(t_orig)
+            if all_p:
+                preds = np.concatenate(all_p).ravel()
+                targets = np.concatenate(all_t).ravel()
+                rmse = np.sqrt(np.mean((preds - targets) ** 2))
+                mae = np.mean(np.abs(preds - targets))
+                acc = np.mean((preds > 0) == (targets > 0))
+                print(f'  📊 测试集评估: RMSE={rmse:.4f}%  MAE={mae:.4f}%  方向准确率={acc:.1%}')
+        else:
+            print(f'  最佳验证损失: {best_val_loss:.6f}')
+
+        return True
+
     def _evaluate(self, X_test: np.ndarray, y_test: np.ndarray):
         """在测试集上评估。"""
         self.model.eval()

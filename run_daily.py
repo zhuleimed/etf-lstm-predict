@@ -24,7 +24,10 @@ from typing import Dict
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_DIR)
 
-from config.etf_config import ensure_dirs, OUTPUT_DIR, ETF_CODES, MODEL_DIR, STATE_FILE
+from config.etf_config import (
+    ensure_dirs, OUTPUT_DIR, ETF_CODES, TRADING_ETF,
+    MODEL_DIR, STATE_FILE, print_config,
+)
 from core.state_manager import StateManager
 from core.simulator import Simulator
 from core.notification import push_daily_report, push_error, push_training_complete
@@ -110,43 +113,19 @@ def _cleanup_lock():
         pass
 
 
-def _train_worker(code_df):
-    """
-    模块级 worker 函数：在独立线程中训练单只 ETF 模型。
-
-    ThreadPoolExecutor 要求目标函数在模块级别定义（可 pickle）。
-    """
-    code, df, use_simple = code_df
-    try:
-        predictor = LSTMTransformerPredictor(use_simple=use_simple)
-        ok = predictor.train(df)
-        if ok:
-            predictor.save(code)
-            return code, 'ok', None
-        return code, 'failed', '训练未收敛'
-    except Exception as e:
-        return code, 'failed', str(e)
-
-
 def train_all_etf_models(force: bool = False) -> Dict[str, str]:
     """
-    训练/重训练所有 ETF 的模型。
+    训练单一合并模型（4 只 ETF 数据合并训练）。
 
     流程：
-      1. 串行加载数据（baostock，每只 ~2 秒，共 ~8 秒）
-      2. 用 ThreadPoolExecutor 并行训练 4 只 ETF
-      3. 串行更新 state（无竞态）
+      1. 串行加载 4 只 ETF 数据
+      2. 调用 train_combined() 合并特征 → 训练单一 LSTM 模型
+      3. 保存为 combined 模型
 
-    总耗时：取决于训练最慢的那只 ETF（约 5~8 分钟/只）
-    正式训练用完整 LSTM-Transformer 模型，测试时用简化版。
-
-    Returns
-    -------
-    dict : {code: 'ok' | 'skipped' | 'failed'}
+    4× 数据量 → 模型更稳健，只交易 510300。
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     from datetime import date
-    from config.etf_config import USE_SIMPLE_MODEL, MAX_WORKERS
+    from config.etf_config import USE_SIMPLE_MODEL
     from core.hs300_utils import fetch_etf_data
 
     results = {}
@@ -156,81 +135,64 @@ def train_all_etf_models(force: bool = False) -> Dict[str, str]:
     print(f'\n{"=" * 50}')
     print(f'  模型训练 — {today.isoformat()}')
     model_tag = '简化版 LSTM' if USE_SIMPLE_MODEL else '完整版 LSTM-Transformer'
-    print(f'  模型: {model_tag}')
-    print(f'  ETF: {", ".join(ETF_CODES)}')
+    print(f'  模型: {model_tag}（4 ETF 合并训练 → 单一模型）')
+    print(f'  数据源: {", ".join(ETF_CODES)}')
+    print(f'  交易:   {TRADING_ETF}')
     print(f'{"=" * 50}')
 
-    # Step 1: 确定需要训练的 ETF
-    codes_to_train = []
-    for code in ETF_CODES:
-        if not force and not state.needs_retrain(code, interval_days=5):
-            print(f'  ⏭ {code}: 距上次训练不足 5 天，跳过')
-            results[code] = 'skipped'
-        else:
-            codes_to_train.append(code)
-
-    if not codes_to_train:
-        print('  所有模型无需训练 ✓')
+    # 检查是否需要训练
+    if not force and not state.needs_retrain('combined', interval_days=5):
+        print(f'  距上次训练不足 5 天，跳过')
+        results['combined'] = 'skipped'
         return results
 
-    # Step 2: 串行加载数据（baostock 不支持并行连接）
-    print(f'\n  📥 加载 {len(codes_to_train)} 只 ETF 数据（baostock）…')
-    data_map = {}
-    for code in codes_to_train:
+    # 加载 4 只 ETF 数据
+    print(f'\n  📥 加载 {len(ETF_CODES)} 只 ETF 数据（baostock）…')
+    valid_dfs = []
+    for code in ETF_CODES:
         df = fetch_etf_data(code)
         if df is not None and len(df) > 50:
-            data_map[code] = df
+            valid_dfs.append(df)
             print(f'    ✓ {code}: {len(df)} 行')
         else:
-            print(f'    ✗ {code}: 数据不足 ({len(df) if df is not None else 0} 行)')
-            results[code] = 'failed'
+            print(f'    ✗ {code}: 数据不足')
 
-    if not data_map:
+    if len(valid_dfs) < 2:
+        print('  有效数据不足 2 只 ETF，训练取消')
+        results['combined'] = 'failed'
         return results
 
-    # Step 3: 线程池并行训练
-    print(f'\n  🏋️  并行训练 {len(data_map)} 个模型 ({model_tag})…')
-    print(f'      (ThreadPoolExecutor, max_workers={MAX_WORKERS})')
+    total_rows = sum(len(df) for df in valid_dfs)
+    print(f'  合并数据: {len(valid_dfs)} 只 ETF, 共 {total_rows} 行')
 
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(data_map))) as ex:
-        futures = {
-            ex.submit(_train_worker, (code, df, USE_SIMPLE_MODEL)): code
-            for code, df in data_map.items()
-        }
-        for f in as_completed(futures):
-            code = futures[f]
-            try:
-                code2, status, err = f.result()
-                if status == 'ok':
-                    state.set_model_trained(code2)
-                    results[code2] = 'ok'
-                    print(f'    ✓ {code2}: 训练完成')
-                else:
-                    results[code2] = 'failed'
-                    print(f'    ✗ {code2}: {err}')
-            except Exception as e:
-                print(f'    ✗ {code}: {e}')
-                results[code] = 'failed'
+    # 训练单一合并模型
+    print(f'\n  🏋️  训练合并模型 ({model_tag})…')
+    predictor = LSTMTransformerPredictor(use_simple=USE_SIMPLE_MODEL)
+    success = predictor.train_combined(valid_dfs, use_simple=USE_SIMPLE_MODEL)
 
-    ok_count = sum(1 for v in results.values() if v == 'ok')
-    print(f'\n  📊 {ok_count}/{len(results)} 训练成功')
+    if success:
+        predictor.save('combined')
+        state.set_model_trained('combined')
+        results['combined'] = 'ok'
+        print(f'  ✓ combined 模型训练完成')
+    else:
+        results['combined'] = 'failed'
+        print(f'  ✗ combined 模型训练失败')
+
     return results
 
 
 def run_daily_simulation(state, simulator, dry_run=False):
     """执行每日模拟盘。"""
     try:
-        # 检查并训练缺失/过期的模型
-        need_train = any(state.needs_retrain(code, interval_days=5)
-                         for code in ETF_CODES)
-        any_missing = any(
-            not LSTMTransformerPredictor().model_exists(code)
-            for code in ETF_CODES
-        )
+        # 检查合并模型是否需要训练
+        need_train = state.needs_retrain('combined', interval_days=5)
+        any_missing = not LSTMTransformerPredictor().model_exists('combined')
         if need_train or any_missing:
             if any_missing:
-                logger.info('检测到新ETF无历史模型')
-            logger.info('开始模型训练…')
+                logger.info('检测到合并模型不存在，开始训练…')
+            else:
+                logger.info('合并模型已过期，开始重训练…')
             train_all_etf_models(force=False)
 
         summary = simulator.run_daily(state_manager=state, dry_run=dry_run)
@@ -259,20 +221,19 @@ def run_health_check():
     state = StateManager()
     print(f'\n  📁 状态文件: {"✓" if os.path.exists(STATE_FILE) else "✗"}')
 
-    # 2. ETF 模型
-    print(f'\n  🤖 ETF 模型:')
-    for code in ETF_CODES:
-        pred = LSTMTransformerPredictor()
-        if pred.model_exists(code):
-            loaded = pred.load(code)
-            if loaded:
-                print(f'    ✓ {code}: 模型文件存在且可加载')
-                model_type = 'simple' if pred.use_simple else 'full'
-                print(f'      类型={model_type}, 特征维度={len(pred.feature_columns)}')
-            else:
-                print(f'    ✗ {code}: 模型文件损坏')
+    # 2. 合并模型
+    print(f'\n  🤖 合并模型 (4 ETF → 单一模型):')
+    pred = LSTMTransformerPredictor()
+    if pred.model_exists('combined'):
+        loaded = pred.load('combined')
+        if loaded:
+            print(f'    ✓ combined: 模型文件存在且可加载')
+            model_type = 'simple' if pred.use_simple else 'full'
+            print(f'      类型={model_type}, 特征维度={len(pred.feature_columns)}')
         else:
-            print(f'    ⚪ {code}: 无模型文件')
+            print(f'    ✗ combined: 模型文件损坏')
+    else:
+        print(f'    ⚪ combined: 无模型文件（请执行 --train）')
 
     # 3. 数据可用性
     print(f'\n  📡 ETF 数据:')
@@ -310,11 +271,18 @@ def main():
                         help='强制重新训练所有模型')
     parser.add_argument('--check', action='store_true',
                         help='系统健康检查')
+    parser.add_argument('--config', action='store_true',
+                        help='显示当前运行参数')
     args = parser.parse_args()
 
     ensure_dirs()
     state = StateManager()
     simulator = Simulator()
+
+    if args.config:
+        print_config()
+        _cleanup_lock()
+        return
 
     if args.check:
         run_health_check()
