@@ -44,7 +44,7 @@
 ## 🔄 每日执行流程
 
 ```
-每日 cron 21:00 触发
+每日 cron 21:10 触发（与项目 A 21:00 错开）
   │
   ├─ 🛡 防重复运行检测（杀残留进程）
   │
@@ -217,8 +217,8 @@ python run_daily.py --train
 ## ⏰ Cron 配置
 
 ```bash
-# 每日模拟盘（交易日 21:00，周一至周五）
-0 21 * * 1-5 cd /public/home/hpc/zhulei/superman/quant/code/016_etf_lstm_predict && \
+# 每日模拟盘（交易日 21:10，与项目 A 21:00 错开）
+10 21 * * 1-5 cd /public/home/hpc/zhulei/superman/quant/code/016_etf_lstm_predict && \
   /home/zhulei/anaconda3/envs/zhulei/bin/python run_daily.py \
   >> logs/daily_$(date +\%Y\%m\%d).log 2>&1
 ```

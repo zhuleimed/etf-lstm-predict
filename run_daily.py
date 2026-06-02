@@ -9,8 +9,8 @@ run_daily.py — ETF LSTM 预测模拟盘系统主入口
   python run_daily.py --dry-run          # 模拟盘 dry-run
 
 Cron 配置:
-  # 每日模拟盘（交易日 21:00）
-  0 21 * * 1-5 cd /path/to/016_etf_lstm_predict && \\
+  # 每日模拟盘（交易日 21:10，与项目 A 21:00 错开 10 分钟）
+  10 21 * * 1-5 cd /path/to/016_etf_lstm_predict && \\
     /home/zhulei/anaconda3/envs/zhulei/bin/python run_daily.py \\
     >> logs/daily_$(date +\%Y\%m\%d).log 2>&1
 """
