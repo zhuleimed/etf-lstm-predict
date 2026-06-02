@@ -487,27 +487,33 @@ class LSTMTransformerPredictor:
         if not os.path.exists(path):
             return False
 
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.feature_scaler = checkpoint['feature_scaler']
-        self.target_scaler = checkpoint['target_scaler']
-        self.feature_columns = checkpoint.get('feature_columns', [])
+        try:
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+            self.feature_scaler = checkpoint['feature_scaler']
+            self.target_scaler = checkpoint['target_scaler']
+            self.feature_columns = checkpoint.get('feature_columns', [])
 
-        # 兼容旧版：没有 use_simple 字段时默认 full
-        saved_use_simple = checkpoint.get('use_simple', False)
-        self.use_simple = saved_use_simple
-        self.params = checkpoint.get('params',
-                                     SIMPLE_MODEL_PARAMS if saved_use_simple
-                                     else PRODUCTION_MODEL_PARAMS)
+            # 兼容旧版：没有 use_simple 字段时默认 full
+            saved_use_simple = checkpoint.get('use_simple', False)
+            self.use_simple = saved_use_simple
+            self.params = checkpoint.get('params',
+                                         SIMPLE_MODEL_PARAMS if saved_use_simple
+                                         else PRODUCTION_MODEL_PARAMS)
 
-        input_dim = len(self.feature_columns) if self.feature_columns else 30
-        model_type = checkpoint.get('model_type', 'full')
-        if model_type == 'simple':
-            self.model = SimpleLSTMModel(input_dim).to(self.device)
-        else:
-            self.model = EnhancedLSTMTransformerModel(input_dim, self.params).to(self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.eval()
-        return True
+            input_dim = len(self.feature_columns) if self.feature_columns else 30
+            model_type = checkpoint.get('model_type', 'full')
+            if model_type == 'simple':
+                self.model = SimpleLSTMModel(input_dim).to(self.device)
+            else:
+                self.model = EnhancedLSTMTransformerModel(input_dim, self.params).to(self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.eval()
+            return True
+
+        except Exception as e:
+            print(f'[模型] 加载 {etf_code} 失败: {e}')
+            self.model = None
+            return False
 
     def model_exists(self, etf_code: str) -> bool:
         path = os.path.join(MODEL_DIR, f'etf_lstm_{etf_code}.pth')

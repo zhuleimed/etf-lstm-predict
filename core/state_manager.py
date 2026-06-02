@@ -110,11 +110,23 @@ class StateManager:
         pf['initial_capital'] = pf.get('initial_capital', INITIAL_CAPITAL)
         pf['_last_portfolio_value'] = portfolio_value
 
-    def add_trade(self, entry: Dict):
+    def add_trade(self, entry: Dict, max_days: int = 180):
+        """
+        追加交易记录，自动清理超过 max_days 天的旧记录。
+        """
         log = self._data.setdefault('trade_log', [])
         log.append(entry)
-        if len(log) > 500:
-            self._data['trade_log'] = log[-500:]
+
+        # 按日期清理：仅保留最近 max_days 天
+        if len(log) > 100:  # 延迟到有足够记录后再清理
+            cutoff = (date.today().isoformat())
+            from datetime import timedelta
+            cutoff_date = date.today() - timedelta(days=max_days)
+            cutoff_str = cutoff_date.isoformat()
+            self._data['trade_log'] = [
+                t for t in log
+                if t.get('date', '').startswith('20') and t.get('date', '') >= cutoff_str
+            ]
 
     # ------------------------------------------------------------------
     # 辅助

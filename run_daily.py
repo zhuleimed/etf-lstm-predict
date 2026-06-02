@@ -17,8 +17,6 @@ Cron 配置:
 
 import argparse
 import os
-import signal
-import subprocess
 import sys
 from datetime import datetime
 from typing import Dict
@@ -26,7 +24,7 @@ from typing import Dict
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_DIR)
 
-from config.etf_config import ensure_dirs, OUTPUT_DIR, ETF_CODES, MODEL_DIR
+from config.etf_config import ensure_dirs, OUTPUT_DIR, ETF_CODES, MODEL_DIR, STATE_FILE
 from core.state_manager import StateManager
 from core.simulator import Simulator
 from core.notification import push_daily_report, push_error, push_training_complete
@@ -249,6 +247,54 @@ def run_daily_simulation(state, simulator, dry_run=False):
         push_error(str(e), '模拟盘')
 
 
+def run_health_check():
+    """健康检查：验证模型、数据、状态文件是否正常。"""
+    from core.hs300_utils import fetch_etf_data
+
+    print(f'\n{"=" * 50}')
+    print(f'  🔍 系统健康检查 — {datetime.now().strftime("%Y-%m-%d %H:%M")}')
+    print(f'{"=" * 50}')
+
+    # 1. 状态文件
+    state = StateManager()
+    print(f'\n  📁 状态文件: {"✓" if os.path.exists(STATE_FILE) else "✗"}')
+
+    # 2. ETF 模型
+    print(f'\n  🤖 ETF 模型:')
+    for code in ETF_CODES:
+        pred = LSTMTransformerPredictor()
+        if pred.model_exists(code):
+            loaded = pred.load(code)
+            if loaded:
+                print(f'    ✓ {code}: 模型文件存在且可加载')
+                model_type = 'simple' if pred.use_simple else 'full'
+                print(f'      类型={model_type}, 特征维度={len(pred.feature_columns)}')
+            else:
+                print(f'    ✗ {code}: 模型文件损坏')
+        else:
+            print(f'    ⚪ {code}: 无模型文件')
+
+    # 3. 数据可用性
+    print(f'\n  📡 ETF 数据:')
+    for code in ETF_CODES:
+        df = fetch_etf_data(code)
+        if df is not None and len(df) > 50:
+            print(f'    ✓ {code}: {len(df)} 行')
+        else:
+            print(f'    ✗ {code}: 数据不可用')
+
+    # 4. 投资组合
+    pf = state.portfolio
+    print(f'\n  💰 投资组合:')
+    print(f'    现金: {pf.get("cash", "N/A"):,.2f}')
+    print(f'    持仓: {len(pf.get("positions", {}))} 只')
+    print(f'    待执行订单: {pf.get("pending_orders", {})}')
+
+    print(f'\n{"=" * 50}')
+    print(f'  检查完成')
+    print(f'{"=" * 50}')
+
+
 def main():
     _check_stale_process()
 
@@ -262,11 +308,18 @@ def main():
                         help='dry-run（不修改状态）')
     parser.add_argument('--train', action='store_true',
                         help='强制重新训练所有模型')
+    parser.add_argument('--check', action='store_true',
+                        help='系统健康检查')
     args = parser.parse_args()
 
     ensure_dirs()
     state = StateManager()
     simulator = Simulator()
+
+    if args.check:
+        run_health_check()
+        _cleanup_lock()
+        return
 
     if args.train:
         results = train_all_etf_models(force=True)
