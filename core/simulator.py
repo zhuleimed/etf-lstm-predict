@@ -19,11 +19,11 @@ from config.etf_config import (
     ETF_CODES, ETF_DESCRIPTIONS, ETF_TAX_FREE,
     INITIAL_CAPITAL, INITIAL_CAPITAL_PER_ETF,
     MIN_TRADE_UNIT, POSITION_PCT,
-    SLIPPAGE, COMMISSION_RATE, TAX_RATE,
+    SLIPPAGE, COMMISSION_RATE,
     SIGNAL_THRESHOLD, STOP_LOSS_PCT,
     WINDOW_SIZE,
 )
-from core.hs300_utils import is_trading_day, fetch_etf_from_baostock
+from core.hs300_utils import is_trading_day, fetch_etf_data
 from core.log_utils import get_logger
 from model.lstm_transformer_predictor import LSTMTransformerPredictor
 
@@ -188,23 +188,18 @@ class Simulator:
     # ==================================================================
 
     def _load_all_etf_data(self) -> Dict[str, Dict]:
-        """加载所有 ETF 的最新数据。"""
-        today = date.today()
-        start = today.replace(year=today.year - 3)
-        start_str = start.strftime('%Y-%m-%d')
-        end_str = today.strftime('%Y-%m-%d')
-
+        """加载所有 ETF 的最新数据（baostock）。"""
         result = {}
         for code in ETF_CODES:
             try:
-                df = fetch_etf_from_baostock(code, start_str, end_str)
-                if df is not None and len(df) > 60:
+                df = fetch_etf_data(code)
+                if df is not None and len(df) > 50:
                     result[code] = {
                         'df': df,
                         'latest': df.iloc[-1],
                     }
                 else:
-                    logger.warning(f'{code}: baostock 数据不足')
+                    logger.warning(f'{code}: 数据不足 ({len(df) if df is not None else 0} 行)')
             except Exception as e:
                 logger.warning(f'{code}: 数据获取失败: {e}')
         return result

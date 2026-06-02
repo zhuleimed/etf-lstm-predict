@@ -112,59 +112,110 @@ def _cleanup_lock():
         pass
 
 
+def _train_worker(code_df):
+    """
+    模块级 worker 函数：在独立线程中训练单只 ETF 模型。
+
+    ThreadPoolExecutor 要求目标函数在模块级别定义（可 pickle）。
+    """
+    code, df, use_simple = code_df
+    try:
+        predictor = LSTMTransformerPredictor(use_simple=use_simple)
+        ok = predictor.train(df)
+        if ok:
+            predictor.save(code)
+            return code, 'ok', None
+        return code, 'failed', '训练未收敛'
+    except Exception as e:
+        return code, 'failed', str(e)
+
+
 def train_all_etf_models(force: bool = False) -> Dict[str, str]:
     """
     训练/重训练所有 ETF 的模型。
 
-    说明：baostock 不支持并行连接，训练过程串行。
-    每只 ETF 约 2~3 分钟，4 只共约 8~12 分钟，
-    每日 cron 21:00 执行，时间充裕。
+    流程：
+      1. 串行加载数据（baostock，每只 ~2 秒，共 ~8 秒）
+      2. 用 ThreadPoolExecutor 并行训练 4 只 ETF
+      3. 串行更新 state（无竞态）
+
+    总耗时：取决于训练最慢的那只 ETF（约 5~8 分钟/只）
+    正式训练用完整 LSTM-Transformer 模型，测试时用简化版。
 
     Returns
     -------
     dict : {code: 'ok' | 'skipped' | 'failed'}
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from datetime import date
-    from core.hs300_utils import fetch_etf_from_baostock
+    from config.etf_config import USE_SIMPLE_MODEL, MAX_WORKERS
+    from core.hs300_utils import fetch_etf_data
 
     results = {}
     state = StateManager()
     today = date.today()
-    start = today.replace(year=today.year - 3)
-    start_str = start.strftime('%Y-%m-%d')
-    end_str = today.strftime('%Y-%m-%d')
 
     print(f'\n{"=" * 50}')
     print(f'  模型训练 — {today.isoformat()}')
+    model_tag = '简化版 LSTM' if USE_SIMPLE_MODEL else '完整版 LSTM-Transformer'
+    print(f'  模型: {model_tag}')
     print(f'  ETF: {", ".join(ETF_CODES)}')
     print(f'{"=" * 50}')
 
+    # Step 1: 确定需要训练的 ETF
+    codes_to_train = []
     for code in ETF_CODES:
         if not force and not state.needs_retrain(code, interval_days=5):
             print(f'  ⏭ {code}: 距上次训练不足 5 天，跳过')
             results[code] = 'skipped'
-            continue
-
-        print(f'\n  📥 加载 {code} 数据…', end=' ', flush=True)
-        df = fetch_etf_from_baostock(code, start_str, end_str)
-        if df is None or len(df) < 50:
-            print(f'数据不足 ({len(df) if df is not None else 0} 行)，跳过')
-            results[code] = 'failed'
-            continue
-        print(f'{len(df)} 行 ✓')
-
-        print(f'  🏋️  训练 {code} 模型…')
-        predictor = LSTMTransformerPredictor()
-        success = predictor.train(df, use_simple=True)
-        if success:
-            predictor.save(code)
-            state.set_model_trained(code)
-            results[code] = 'ok'
-            print(f'  ✓ {code}: 训练完成')
         else:
-            results[code] = 'failed'
-            print(f'  ✗ {code}: 训练失败')
+            codes_to_train.append(code)
 
+    if not codes_to_train:
+        print('  所有模型无需训练 ✓')
+        return results
+
+    # Step 2: 串行加载数据（baostock 不支持并行连接）
+    print(f'\n  📥 加载 {len(codes_to_train)} 只 ETF 数据（baostock）…')
+    data_map = {}
+    for code in codes_to_train:
+        df = fetch_etf_data(code)
+        if df is not None and len(df) > 50:
+            data_map[code] = df
+            print(f'    ✓ {code}: {len(df)} 行')
+        else:
+            print(f'    ✗ {code}: 数据不足 ({len(df) if df is not None else 0} 行)')
+            results[code] = 'failed'
+
+    if not data_map:
+        return results
+
+    # Step 3: 线程池并行训练
+    print(f'\n  🏋️  并行训练 {len(data_map)} 个模型 ({model_tag})…')
+    print(f'      (ThreadPoolExecutor, max_workers={MAX_WORKERS})')
+
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(data_map))) as ex:
+        futures = {
+            ex.submit(_train_worker, (code, df, USE_SIMPLE_MODEL)): code
+            for code, df in data_map.items()
+        }
+        for f in as_completed(futures):
+            code = futures[f]
+            try:
+                code2, status, err = f.result()
+                if status == 'ok':
+                    state.set_model_trained(code2)
+                    results[code2] = 'ok'
+                    print(f'    ✓ {code2}: 训练完成')
+                else:
+                    results[code2] = 'failed'
+                    print(f'    ✗ {code2}: {err}')
+            except Exception as e:
+                print(f'    ✗ {code}: {e}')
+                results[code] = 'failed'
+
+    ok_count = sum(1 for v in results.values() if v == 'ok')
+    print(f'\n  📊 {ok_count}/{len(results)} 训练成功')
     return results
 
 

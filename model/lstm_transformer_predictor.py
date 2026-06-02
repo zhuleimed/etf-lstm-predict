@@ -23,7 +23,8 @@ from sklearn.preprocessing import StandardScaler
 warnings.filterwarnings('ignore')
 
 from config.etf_config import (
-    DEVICE, DEFAULT_MODEL_PARAMS, MODEL_DIR, SEED,
+    DEVICE, PRODUCTION_MODEL_PARAMS, SIMPLE_MODEL_PARAMS,
+    USE_SIMPLE_MODEL, MODEL_DIR, SEED,
     TRAIN_RATIO, VAL_RATIO, EARLY_STOPPING_PATIENCE,
     WINDOW_SIZE,
 )
@@ -196,13 +197,23 @@ class LSTMTransformerPredictor:
     整合数据准备、模型训练、预测、保存/加载功能。
     """
 
-    def __init__(self):
+    def __init__(self, use_simple: bool = False):
+        """
+        Parameters
+        ----------
+        use_simple : bool
+            True=简化版LSTM（测试用），False=完整LSTM-Transformer（正式用）
+        """
         self.device = DEVICE
         self.model = None
         self.feature_scaler = StandardScaler()
         self.target_scaler = StandardScaler()
         self.feature_columns: List[str] = []
-        self.params = DEFAULT_MODEL_PARAMS.copy()
+        self.use_simple = use_simple
+        if use_simple:
+            self.params = SIMPLE_MODEL_PARAMS.copy()
+        else:
+            self.params = PRODUCTION_MODEL_PARAMS.copy()
 
     # ------------------------------------------------------------------
     # 数据准备
@@ -221,12 +232,12 @@ class LSTMTransformerPredictor:
         """
         # 计算特征
         feat_df = compute_features(df)
-        if feat_df is None or len(feat_df) < 50:
+        if feat_df is None or len(feat_df) < 40:
             return None
 
         # 创建序列
         X_seq, y_seq, self.feature_columns = create_sequences(feat_df)
-        if len(X_seq) < 15:
+        if len(X_seq) < 10:
             return None
 
         n = len(X_seq)
@@ -268,7 +279,7 @@ class LSTMTransformerPredictor:
     # 训练
     # ------------------------------------------------------------------
 
-    def train(self, df: pd.DataFrame, use_simple: bool = False) -> bool:
+    def train(self, df: pd.DataFrame, use_simple: Optional[bool] = None) -> bool:
         """
         训练模型。
 
@@ -276,13 +287,16 @@ class LSTMTransformerPredictor:
         ----------
         df : pd.DataFrame
             ETF 日线数据
-        use_simple : bool
-            True=使用 SimpleLSTMModel（更快）
+        use_simple : bool or None
+            True=简化版LSTM（测试用），False=完整版，None=使用 self.use_simple
 
         Returns
         -------
         bool : 训练是否成功
         """
+        if use_simple is None:
+            use_simple = self.use_simple
+
         data = self.prepare_data_from_df(df)
         if data is None:
             print('  ⚠ 数据准备失败，无法训练')
@@ -293,10 +307,10 @@ class LSTMTransformerPredictor:
 
         if use_simple:
             self.model = SimpleLSTMModel(input_dim).to(self.device)
-            print('  📦 使用简化版 LSTM 模型')
+            print('  📦 使用简化版 LSTM 模型（测试用）')
         else:
             self.model = EnhancedLSTMTransformerModel(input_dim, self.params).to(self.device)
-            print('  📦 使用增强版 LSTM-Transformer 模型')
+            print('  📦 使用增强版 LSTM-Transformer 模型（正式）')
 
         # 创建 DataLoader
         train_dataset = StockDataset(X_train, y_train)
@@ -462,6 +476,8 @@ class LSTMTransformerPredictor:
             'feature_columns': self.feature_columns,
             'params': self.params,
             'model_type': 'simple' if isinstance(self.model, SimpleLSTMModel) else 'full',
+            'window_size': WINDOW_SIZE,
+            'use_simple': self.use_simple,
         }, path)
         return path
 
@@ -475,7 +491,13 @@ class LSTMTransformerPredictor:
         self.feature_scaler = checkpoint['feature_scaler']
         self.target_scaler = checkpoint['target_scaler']
         self.feature_columns = checkpoint.get('feature_columns', [])
-        self.params = checkpoint.get('params', DEFAULT_MODEL_PARAMS)
+
+        # 兼容旧版：没有 use_simple 字段时默认 full
+        saved_use_simple = checkpoint.get('use_simple', False)
+        self.use_simple = saved_use_simple
+        self.params = checkpoint.get('params',
+                                     SIMPLE_MODEL_PARAMS if saved_use_simple
+                                     else PRODUCTION_MODEL_PARAMS)
 
         input_dim = len(self.feature_columns) if self.feature_columns else 30
         model_type = checkpoint.get('model_type', 'full')
